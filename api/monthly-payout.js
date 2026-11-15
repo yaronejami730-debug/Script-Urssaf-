@@ -21,7 +21,8 @@ export function labels(year, month) {
  *  C = CA encaissé depuis le dernier envoi, A = solde disponible,
  *  reservePrev = réserve dette déjà mise de côté dans Stripe.
  */
-export function computeRun({ C, A, reservePrev = 0, pct = 30, debtPct = 10, target = 0, min = 100 }) {
+export function computeRun({ C, A, reservePrev = 0, pct = 30, debtPct = 10, target = 0, min = 100, debtDone = false }) {
+  if (debtDone) target = 0; // dette déjà remboursée : plus de réserve
   const U = Math.max(0, Math.min(Math.floor((C * pct) / 100), A));
   let D = 0;
   if (target > 0 && reservePrev < target) {
@@ -95,6 +96,7 @@ function createPayout(kind, amount, currency, monthKey, label, destination, meta
       "metadata[kind]": kind,
       "metadata[cutoff]": String(meta.cutoff),
       "metadata[debt_reserve]": String(meta.held),
+      "metadata[debt_done]": meta.debtDone ? "1" : "0",
       "metadata[count]": String(meta.count),
       ...(destination ? { destination } : {}),
     },
@@ -132,6 +134,7 @@ export async function GET(request) {
   const last = recent.find((p) => p.metadata?.cutoff);
   const startDefault = env("START_DATE") ? env("START_DATE").split("-").map(Number) : [y, m, 1];
   const periodStart = last ? Number(last.metadata.cutoff) : parisMidnight(...startDefault);
+  const debtDone = recent.some((p) => p.metadata?.kind === "dette") || last?.metadata?.debt_done === "1" || env("DEBT_DONE") === "true";
   const reservePrev = last ? Number(last.metadata.debt_reserve || 0) : Number(env("DEBT_RESERVE_START_CENTS", "0"));
 
   const C = await revenueBetween(periodStart, now, currency);
@@ -139,7 +142,7 @@ export async function GET(request) {
   const A = balance.available.find((b) => b.currency === currency)?.amount ?? 0;
 
   const r = computeRun({
-    C, A, reservePrev,
+    C, A, reservePrev, debtDone,
     pct: Number(env("URSSAF_PCT", "30")),
     debtPct: Number(env("DEBT_PCT", "10")),
     target: Number(env("DEBT_TARGET_CENTS", "0")),
@@ -153,7 +156,7 @@ export async function GET(request) {
   if (env("DRY_RUN", "true") === "true") return Response.json({ action: "dry-run", will_pay: kinds, ...summary });
 
   const dest = { urssaf: env("PAYOUT_DESTINATION_URSSAF"), dette: env("PAYOUT_DESTINATION_URSSAF"), net: env("PAYOUT_DESTINATION_NET") };
-  const meta = { cutoff: now, held: r.heldAfter, count: kinds.length };
+  const meta = { cutoff: now, held: r.heldAfter, count: kinds.length, debtDone: debtDone || r.dette > 0 };
   const results = {};
   for (const k of kinds) {
     const p = await createPayout(k, r[k], currency, monthKey, lab[k], dest[k], meta);
