@@ -11,7 +11,35 @@ export function labels(year, month) {
   const next = month === 12 ? { y: year + 1, m: 1 } : { y: year, m: month + 1 };
   return {
     urssaf: { descriptor: `URSSAF CA ${short}`, description: `Provision URSSAF : CA de ${MONTHS_FULL[month - 1]} ${year}, à déclarer en ${MONTHS_FULL[next.m - 1]} ${next.y}` },
+    dette: { descriptor: `URSSAF DETTE ${short}`, description: `Remboursement dette URSSAF (réserve atteinte en ${MONTHS_FULL[month - 1]} ${year})` },
     net: { descriptor: `CA NET ${short}`, description: `CA net de ${MONTHS_FULL[month - 1]} ${year} (après provision URSSAF)` },
+  };
+}
+
+/**
+ * Calcul pur (testable). Tous les montants en centimes.
+ *  C = CA encaissé depuis le dernier envoi, A = solde disponible,
+ *  reservePrev = réserve dette déjà mise de côté dans Stripe.
+ */
+export function computeRun({ C, A, reservePrev = 0, pct = 30, debtPct = 10, target = 0, min = 100 }) {
+  const U = Math.max(0, Math.min(Math.floor((C * pct) / 100), A));
+  let D = 0;
+  if (target > 0 && reservePrev < target) {
+    D = Math.max(0, Math.min(Math.floor((C * debtPct) / 100), target - reservePrev, A - U));
+  }
+  const reserveNew = reservePrev + D;
+  let debtPayout = 0, held = reserveNew;
+  if (target > 0 && reserveNew >= target) {
+    debtPayout = Math.min(reserveNew, A - U);
+    held = reserveNew - debtPayout;
+  }
+  const N = Math.max(0, A - U - debtPayout - Math.min(held, Math.max(0, A - U - debtPayout)));
+  return {
+    urssaf: U >= min ? U : 0,
+    dette: debtPayout >= min ? debtPayout : 0,
+    net: N >= min ? N : 0,
+    heldAfter: held,
+    debtAdded: D,
   };
 }
 
@@ -30,7 +58,6 @@ async function stripe(path, method = "GET", body, idempotencyKey) {
   return json;
 }
 
-
 // Timestamp UNIX (secondes) de minuit à Paris pour un jour donné
 export function parisMidnight(y, m, d) {
   const guess = Date.UTC(y, m - 1, d, 0, 0, 0);
@@ -40,17 +67,14 @@ export function parisMidnight(y, m, d) {
   return Math.floor((guess - hours * 3600000) / 1000);
 }
 
-// CA brut encaissé dans le mois (par date de paiement), remboursements déduits, en centimes
-async function monthRevenue(y, m, currency) {
-  const from = parisMidnight(y, m, 1);
-  const to = m === 12 ? parisMidnight(y + 1, 1, 1) : parisMidnight(y, m + 1, 1);
+// CA brut encaissé entre deux instants (date du paiement), remboursements déduits, en centimes
+async function revenueBetween(from, to, currency) {
   let total = 0, startingAfter;
   for (let i = 0; i < 50; i++) {
-    const q = `/balance_transactions?limit=100&created[gte]=${from}&created[lt]=${to}&currency=${currency}${startingAfter ? `&starting_after=${startingAfter}` : ""}`;
+    const q = `/balance_transactions?limit=100&created[gt]=${from}&created[lte]=${to}&currency=${currency}${startingAfter ? `&starting_after=${startingAfter}` : ""}`;
     const page = await stripe(q);
     for (const t of page.data) {
-      if (["charge", "payment"].includes(t.type)) total += t.amount;
-      else if (["refund", "payment_refund"].includes(t.type)) total += t.amount; // négatif
+      if (["charge", "payment", "refund", "payment_refund"].includes(t.type)) total += t.amount; // refund négatif
     }
     if (!page.has_more) break;
     startingAfter = page.data[page.data.length - 1].id;
@@ -58,7 +82,7 @@ async function monthRevenue(y, m, currency) {
   return total;
 }
 
-async function createPayout(kind, amount, currency, monthKey, label, destination) {
+function createPayout(kind, amount, currency, monthKey, label, destination, meta) {
   return stripe(
     "/payouts",
     "POST",
@@ -69,9 +93,12 @@ async function createPayout(kind, amount, currency, monthKey, label, destination
       statement_descriptor: label.descriptor,
       "metadata[month]": monthKey,
       "metadata[kind]": kind,
+      "metadata[cutoff]": String(meta.cutoff),
+      "metadata[debt_reserve]": String(meta.held),
+      "metadata[count]": String(meta.count),
       ...(destination ? { destination } : {}),
     },
-    `${kind}-${monthKey}`,
+    `${kind}-${monthKey}-${meta.cutoff}`,
   );
 }
 
@@ -91,42 +118,46 @@ export async function GET(request) {
   if (today < plan.send && !force) return Response.json({ action: "wait", today, ...plan });
 
   const currency = env("CURRENCY", "eur");
-  const pct = Number(env("URSSAF_PCT", "30"));
   const lab = labels(y, m);
+  const now = Math.floor(Date.now() / 1000);
 
-  // Quels virements existent déjà pour ce mois ?
-  const recent = await stripe("/payouts?limit=50");
-  const done = (kind) =>
-    recent.data.some((p) => p.metadata?.month === monthKey && p.metadata?.kind === kind && !["failed", "canceled"].includes(p.status));
-  const urssafDone = done("urssaf");
-  const netDone = done("net");
-  if (urssafDone && netDone) return Response.json({ action: "already-done", month: monthKey });
-
-  const balance = await stripe("/balance");
-  const available = balance.available.find((b) => b.currency === currency)?.amount ?? 0; // centimes
-
-  // Cas normal : les deux virements partent du même solde. Cas partiel : on arrête et on signale.
-  if (urssafDone !== netDone) {
-    return Response.json({ action: "partial-state-check-manually", month: monthKey, urssafDone, netDone, available }, { status: 409 });
+  // État reconstruit depuis les virements passés (aucune base de données)
+  const recent = (await stripe("/payouts?limit=100")).data.filter((p) => !["failed", "canceled"].includes(p.status));
+  const thisMonth = recent.filter((p) => p.metadata?.month === monthKey);
+  if (thisMonth.length) {
+    const expected = Number(thisMonth[0].metadata.count || 0);
+    if (thisMonth.length >= expected) return Response.json({ action: "already-done", month: monthKey });
+    return Response.json({ action: "partial-state-check-manually", month: monthKey, found: thisMonth.length, expected }, { status: 409 });
   }
+  const last = recent.find((p) => p.metadata?.cutoff);
+  const startDefault = env("START_DATE") ? env("START_DATE").split("-").map(Number) : [y, m, 1];
+  const periodStart = last ? Number(last.metadata.cutoff) : parisMidnight(...startDefault);
+  const reservePrev = last ? Number(last.metadata.debt_reserve || 0) : Number(env("DEBT_RESERVE_START_CENTS", "0"));
 
-  // URSSAF = pct % du CA encaissé dans le mois (date du paiement), plafonné au solde disponible
-  const monthCA = await monthRevenue(y, m, currency);
-  const urssafAmount = Math.max(0, Math.min(Math.floor((monthCA * pct) / 100), available));
-  const netAmount = available - urssafAmount;
-  const min = Number(env("MIN_PAYOUT_CENTS", "100"));
-  const summary = { today, month: monthKey, ...plan, monthCA, available, urssafAmount, netAmount, pct, labels: { urssaf: lab.urssaf.descriptor, net: lab.net.descriptor } };
+  const C = await revenueBetween(periodStart, now, currency);
+  const balance = await stripe("/balance");
+  const A = balance.available.find((b) => b.currency === currency)?.amount ?? 0;
+
+  const r = computeRun({
+    C, A, reservePrev,
+    pct: Number(env("URSSAF_PCT", "30")),
+    debtPct: Number(env("DEBT_PCT", "10")),
+    target: Number(env("DEBT_TARGET_CENTS", "0")),
+    min: Number(env("MIN_PAYOUT_CENTS", "100")),
+  });
+  const kinds = ["urssaf", "dette", "net"].filter((k) => r[k] > 0);
+  const summary = { today, month: monthKey, ...plan, periodStart, revenue: C, available: A, reservePrev, ...r };
   console.log("monthly-payout", JSON.stringify(summary));
 
-  if (available < min * 2) return Response.json({ action: "skip-too-small", ...summary });
-  if (env("DRY_RUN", "true") === "true") return Response.json({ action: "dry-run", ...summary });
+  if (!kinds.length) return Response.json({ action: "nothing-to-pay", ...summary });
+  if (env("DRY_RUN", "true") === "true") return Response.json({ action: "dry-run", will_pay: kinds, ...summary });
 
-  const urssaf = await createPayout("urssaf", urssafAmount, currency, monthKey, lab.urssaf, env("PAYOUT_DESTINATION_URSSAF"));
-  const net = await createPayout("net", netAmount, currency, monthKey, lab.net, env("PAYOUT_DESTINATION_NET"));
-  return Response.json({
-    action: "paid-out",
-    urssaf: { id: urssaf.id, arrival_date: urssaf.arrival_date },
-    net: { id: net.id, arrival_date: net.arrival_date },
-    ...summary,
-  });
+  const dest = { urssaf: env("PAYOUT_DESTINATION_URSSAF"), dette: env("PAYOUT_DESTINATION_URSSAF"), net: env("PAYOUT_DESTINATION_NET") };
+  const meta = { cutoff: now, held: r.heldAfter, count: kinds.length };
+  const results = {};
+  for (const k of kinds) {
+    const p = await createPayout(k, r[k], currency, monthKey, lab[k], dest[k], meta);
+    results[k] = { id: p.id, amount: r[k], arrival_date: p.arrival_date };
+  }
+  return Response.json({ action: "paid-out", results, ...summary });
 }
