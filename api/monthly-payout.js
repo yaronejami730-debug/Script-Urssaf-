@@ -64,6 +64,8 @@ export async function GET(request) {
       amount: String(amount),
       currency,
       description: `Provision URSSAF ${monthKey}`,
+      // Libellé visible sur le relevé bancaire (22 caractères max)
+      statement_descriptor: `URSSAF ${monthKey}`,
       "metadata[urssaf_month]": monthKey,
       ...(env("PAYOUT_DESTINATION") ? { destination: env("PAYOUT_DESTINATION") } : {}),
     },
