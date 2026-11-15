@@ -30,6 +30,34 @@ async function stripe(path, method = "GET", body, idempotencyKey) {
   return json;
 }
 
+
+// Timestamp UNIX (secondes) de minuit à Paris pour un jour donné
+export function parisMidnight(y, m, d) {
+  const guess = Date.UTC(y, m - 1, d, 0, 0, 0);
+  const off = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Paris", timeZoneName: "shortOffset" })
+    .formatToParts(new Date(guess)).find((p) => p.type === "timeZoneName").value; // ex: "GMT+1"
+  const hours = Number((off.match(/GMT([+-]\d+)/) || [0, 0])[1]);
+  return Math.floor((guess - hours * 3600000) / 1000);
+}
+
+// CA brut encaissé dans le mois (par date de paiement), remboursements déduits, en centimes
+async function monthRevenue(y, m, currency) {
+  const from = parisMidnight(y, m, 1);
+  const to = m === 12 ? parisMidnight(y + 1, 1, 1) : parisMidnight(y, m + 1, 1);
+  let total = 0, startingAfter;
+  for (let i = 0; i < 50; i++) {
+    const q = `/balance_transactions?limit=100&created[gte]=${from}&created[lt]=${to}&currency=${currency}${startingAfter ? `&starting_after=${startingAfter}` : ""}`;
+    const page = await stripe(q);
+    for (const t of page.data) {
+      if (["charge", "payment"].includes(t.type)) total += t.amount;
+      else if (["refund", "payment_refund"].includes(t.type)) total += t.amount; // négatif
+    }
+    if (!page.has_more) break;
+    startingAfter = page.data[page.data.length - 1].id;
+  }
+  return total;
+}
+
 async function createPayout(kind, amount, currency, monthKey, label, destination) {
   return stripe(
     "/payouts",
@@ -82,10 +110,12 @@ export async function GET(request) {
     return Response.json({ action: "partial-state-check-manually", month: monthKey, urssafDone, netDone, available }, { status: 409 });
   }
 
-  const urssafAmount = Math.floor((available * pct) / 100);
+  // URSSAF = pct % du CA encaissé dans le mois (date du paiement), plafonné au solde disponible
+  const monthCA = await monthRevenue(y, m, currency);
+  const urssafAmount = Math.max(0, Math.min(Math.floor((monthCA * pct) / 100), available));
   const netAmount = available - urssafAmount;
   const min = Number(env("MIN_PAYOUT_CENTS", "100"));
-  const summary = { today, month: monthKey, ...plan, available, urssafAmount, netAmount, pct, labels: { urssaf: lab.urssaf.descriptor, net: lab.net.descriptor } };
+  const summary = { today, month: monthKey, ...plan, monthCA, available, urssafAmount, netAmount, pct, labels: { urssaf: lab.urssaf.descriptor, net: lab.net.descriptor } };
   console.log("monthly-payout", JSON.stringify(summary));
 
   if (available < min * 2) return Response.json({ action: "skip-too-small", ...summary });
