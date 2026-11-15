@@ -1,0 +1,7 @@
+{
+  "name": "wise-urssaf-split",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" }
+}
