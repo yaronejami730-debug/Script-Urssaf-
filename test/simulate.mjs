@@ -65,7 +65,7 @@ globalThis.fetch = async (url, init = {}) => {
 process.env.STRIPE_SECRET_KEY = "sk_test_fake";
 process.env.CRON_SECRET = "s3cret";
 process.env.DEBT_TARGET_CENTS = "100000";
-process.env.DEBT_PCT = "10";
+process.env.DEBT_PCT = "15";
 process.env.START_DATE = "2026-11-01";
 process.env.DRY_RUN = "false";
 
