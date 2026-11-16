@@ -1,4 +1,5 @@
 import { planFor, todayParis } from "../lib/calendar.js";
+import { makeTaxFn } from "../lib/tax.js";
 
 const env = (k, d) => process.env[k] ?? d;
 
@@ -12,6 +13,7 @@ export function labels(year, month) {
   return {
     urssaf: { descriptor: `URSSAF CA ${short}`, description: `Provision URSSAF : CA de ${MONTHS_FULL[month - 1]} ${year}, à déclarer en ${MONTHS_FULL[next.m - 1]} ${next.y}` },
     dette: { descriptor: `URSSAF DETTE ${short}`, description: `Remboursement dette URSSAF (réserve atteinte en ${MONTHS_FULL[month - 1]} ${year})` },
+    impots: { descriptor: `IMPOTS REVENU ${year}`, description: `Provision impôt sur le revenu ${year}, à payer lors de la déclaration` },
     net: { descriptor: `CA NET ${short}`, description: `CA net de ${MONTHS_FULL[month - 1]} ${year} (après provision URSSAF)` },
   };
 }
@@ -21,7 +23,10 @@ export function labels(year, month) {
  *  C = CA encaissé depuis le dernier envoi, A = solde disponible,
  *  reservePrev = réserve dette déjà mise de côté dans Stripe.
  */
-export function computeRun({ C, A, reservePrev = 0, pct = 30, debtPct = 10, target = 0, min = 100, debtDone = false }) {
+export function computeRun({
+  C, A, reservePrev = 0, pct = 30, debtPct = 10, target = 0, min = 100, debtDone = false,
+  ytd = 0, taxReserve = 0, taxFn = null, taxPayoutNow = false,
+}) {
   if (debtDone) target = 0; // dette déjà remboursée : plus de réserve
   const U = Math.max(0, Math.min(Math.floor((C * pct) / 100), A));
   let D = 0;
@@ -34,13 +39,29 @@ export function computeRun({ C, A, reservePrev = 0, pct = 30, debtPct = 10, targ
     debtPayout = Math.min(reserveNew, A - U);
     held = reserveNew - debtPayout;
   }
-  const N = Math.max(0, A - U - debtPayout - Math.min(held, Math.max(0, A - U - debtPayout)));
+
+  // Impôt sur le revenu : réserve cumulée = impôt estimé sur le CA cumulé de l'année
+  let T = 0;
+  if (taxFn) {
+    const wanted = Math.max(0, taxFn(ytd + C) - taxReserve);
+    T = Math.max(0, Math.min(wanted, A - U - D - reservePrev - taxReserve));
+  }
+  const taxReserveNew = taxReserve + T;
+  const taxPay = taxPayoutNow ? Math.min(taxReserveNew, Math.max(0, A - U - debtPayout)) : 0;
+  const taxHeld = taxReserveNew - taxPay;
+
+  const rest = Math.max(0, A - U - debtPayout - taxPay);
+  const N = Math.max(0, rest - Math.min(held + taxHeld, rest));
   return {
     urssaf: U >= min ? U : 0,
     dette: debtPayout >= min ? debtPayout : 0,
+    impots: taxPay >= min ? taxPay : 0,
     net: N >= min ? N : 0,
     heldAfter: held,
     debtAdded: D,
+    taxHeld,
+    taxAdded: T,
+    ytdAfter: ytd + C,
   };
 }
 
@@ -98,6 +119,9 @@ function createPayout(kind, amount, currency, monthKey, label, destination, meta
       "metadata[debt_reserve]": String(meta.held),
       "metadata[debt_done]": meta.debtDone ? "1" : "0",
       "metadata[count]": String(meta.count),
+      "metadata[tax_reserve]": String(meta.taxHeld),
+      "metadata[ytd]": String(meta.ytd),
+      "metadata[tax_year]": String(meta.taxYear),
       ...(destination ? { destination } : {}),
     },
     `${kind}-${monthKey}-${meta.cutoff}`,
@@ -137,26 +161,39 @@ export async function GET(request) {
   const debtDone = recent.some((p) => p.metadata?.kind === "dette") || last?.metadata?.debt_done === "1" || env("DEBT_DONE") === "true";
   const reservePrev = last ? Number(last.metadata.debt_reserve || 0) : Number(env("DEBT_RESERVE_START_CENTS", "0"));
 
+  // Impôt : CA cumulé de l'année civile + réserve déjà constituée
+  const sameYear = last && Number(last.metadata.tax_year) === y;
+  const ytd = sameYear ? Number(last.metadata.ytd || 0) : (last ? 0 : Number(env("YTD_START_CENTS", "0")));
+  const taxReserve = last ? Number(last.metadata.tax_reserve || 0) : 0;
+  const taxOn = env("TAX_ENABLED", "true") === "true";
+  const taxFn = taxOn ? makeTaxFn({
+    abatement: Number(env("TAX_ABATEMENT_PCT", "34")),
+    parts: Number(env("TAX_PARTS", "1")),
+    otherIncomeCents: Number(env("TAX_OTHER_INCOME_CENTS", "0")),
+    ...(env("TAX_BRACKETS_JSON") ? { brackets: JSON.parse(env("TAX_BRACKETS_JSON")).map(([c, r]) => [c ?? Infinity, r]) } : {}),
+  }) : null;
+  const taxPayoutNow = taxOn && m === Number(env("TAX_PAYOUT_MONTH", "12"));
+
   const C = await revenueBetween(periodStart, now, currency);
   const balance = await stripe("/balance");
   const A = balance.available.find((b) => b.currency === currency)?.amount ?? 0;
 
   const r = computeRun({
-    C, A, reservePrev, debtDone,
+    C, A, reservePrev, debtDone, ytd, taxReserve, taxFn, taxPayoutNow,
     pct: Number(env("URSSAF_PCT", "30")),
     debtPct: Number(env("DEBT_PCT", "10")),
     target: Number(env("DEBT_TARGET_CENTS", "0")),
     min: Number(env("MIN_PAYOUT_CENTS", "100")),
   });
-  const kinds = ["urssaf", "dette", "net"].filter((k) => r[k] > 0);
+  const kinds = ["urssaf", "dette", "impots", "net"].filter((k) => r[k] > 0);
   const summary = { today, month: monthKey, ...plan, periodStart, revenue: C, available: A, reservePrev, ...r };
   console.log("monthly-payout", JSON.stringify(summary));
 
   if (!kinds.length) return Response.json({ action: "nothing-to-pay", ...summary });
   if (env("DRY_RUN", "true") === "true") return Response.json({ action: "dry-run", will_pay: kinds, ...summary });
 
-  const dest = { urssaf: env("PAYOUT_DESTINATION_URSSAF"), dette: env("PAYOUT_DESTINATION_URSSAF"), net: env("PAYOUT_DESTINATION_NET") };
-  const meta = { cutoff: now, held: r.heldAfter, count: kinds.length, debtDone: debtDone || r.dette > 0 };
+  const dest = { urssaf: env("PAYOUT_DESTINATION_URSSAF"), dette: env("PAYOUT_DESTINATION_URSSAF"), impots: env("PAYOUT_DESTINATION_NET"), net: env("PAYOUT_DESTINATION_NET") };
+  const meta = { cutoff: now, held: r.heldAfter, count: kinds.length, debtDone: debtDone || r.dette > 0, taxHeld: r.taxHeld, ytd: r.ytdAfter, taxYear: y };
   const results = {};
   for (const k of kinds) {
     const p = await createPayout(k, r[k], currency, monthKey, lab[k], dest[k], meta);
