@@ -96,7 +96,9 @@ async function revenueBetween(from, to, currency) {
     const q = `/balance_transactions?limit=100&created[gt]=${from}&created[lte]=${to}&currency=${currency}${startingAfter ? `&starting_after=${startingAfter}` : ""}`;
     const page = await stripe(q);
     for (const t of page.data) {
-      if (["charge", "payment", "refund", "payment_refund"].includes(t.type)) total += t.amount; // refund négatif
+      // remboursements et litiges perdus sont négatifs ; litige gagné (dispute_reversal) redevient positif
+      const cat = t.reporting_category ?? t.type;
+      if (["charge", "payment", "refund", "payment_refund", "dispute", "dispute_reversal"].includes(cat)) total += t.amount;
     }
     if (!page.has_more) break;
     startingAfter = page.data[page.data.length - 1].id;
@@ -169,8 +171,8 @@ export async function GET(request) {
   const taxFn = taxOn ? makeTaxFn({
     abatement: Number(env("TAX_ABATEMENT_PCT", "34")),
     parts: Number(env("TAX_PARTS", "1")),
+    couple: env("TAX_COUPLE", "false") === "true",
     otherIncomeCents: Number(env("TAX_OTHER_INCOME_CENTS", "0")),
-    ...(env("TAX_BRACKETS_JSON") ? { brackets: JSON.parse(env("TAX_BRACKETS_JSON")).map(([c, r]) => [c ?? Infinity, r]) } : {}),
   }) : null;
   const taxPayoutNow = taxOn && m === Number(env("TAX_PAYOUT_MONTH", "12"));
 
